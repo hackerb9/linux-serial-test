@@ -12,15 +12,20 @@ changes by hackerb9 which may or may not be improvements.
    not report an error if it differs from Rx. 
 1. Does report an error if the serial hardware (or kernel module) is
    unable to set the requested baudrate.
+1. Attempts to workaround Linux's `closing_wait` delay of 30 seconds
+   after exiting the program which occurs when the kernel's transmit
+   buffer is very large compared to the receive baudrate. (See
+   setserial(8)). The workaround requires root access, which is
+   typically not needed for this program, so the workaround is skipped
+   if the kernel's transmit buffer is estimated to be drained quickly.
 1. Measures an estimate of the received baudrate and, optionally,
    reports an error if it is significantly different than requested.
 1. EAGAIN exits process_read_data() since it likely means there is no
-   more data available. This avoids the situation where
-   linux-serial-test would hang and have to be killed with ^C three
-   times.
+   more data available. This avoids the situation where linux-serial-test 
+   would hang and have to be killed with ^C three times.
 1. Allow non-standard baudrates to be specified directly instead of
    requiring a clock divisor. E.g., `-b 512000`.
-1. Allow baudrates to be specified in "Engineering notation" (see
+1. Allow baudrates to be specified in "exponential notation" (see
    strtod(3)). For example, `-b 3E6` would be equivalent to `-b 3000000`.
 1. The results of the test are printed clearly when the program exits.
 
