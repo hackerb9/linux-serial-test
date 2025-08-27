@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: MIT
+// "Oh, bother," said Pooh. 
+
 
 #include <stdio.h>		/* perror(), printf() */
 #include <errno.h>		/* errno */
@@ -40,7 +42,7 @@ extern int __ioctl_time64 (int __fd, unsigned long int __request, ...) __THROW;
 
 
 /* setserial's TIOCSSERIAL with custom_divisor is deprecated. Use termios2, if possible. */
-int set_custom_baud(int fd, int speed)
+int bother_set_baud(int fd, speed_t speed)
 {
 	// speed was not one of the POSIX baudrates, so set it directly with termios2.
 	struct termios2 tio;
@@ -58,6 +60,17 @@ int set_custom_baud(int fd, int speed)
 		perror("TCSETS2 setting baudrate");
 		return ret;
 	}
-	return 0;
+	return 0;		/* sucess */
+}
+
+speed_t bother_get_baud(int fd) {
+	struct termios2 tio;
+
+	if (ioctl(fd, TCGETS2, &tio) < 0) {
+		int ret = -errno;
+		perror("TCGETS2 failed");
+		return ret;
+	}		
+	return tio.c_ispeed;
 }
 

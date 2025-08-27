@@ -19,10 +19,11 @@
 #include <sys/file.h>
 #include <signal.h>
 #include <stdbool.h>
-#include <locale.h>		/* For numeric grouping commas to mark thousands  */
-#include <assert.h>		/* For sanity checking */
+#include <locale.h>	    /* For numeric grouping commas to mark thousands */
+#include <assert.h>	    /* For sanity checking */
+static const speed_t _speed_t_max = -1;	 /* typically unsigned int */
 
-#include "setbaudrate.h"	/* For set_custom_baud() via termios2 */
+#include "bother.h"		/* For bother_set_baud() via termios2 */
 
 /*
  * glibc for MIPS has its own bits/termios.h which does not define
@@ -77,6 +78,7 @@ int _cl_tx_timeout_ms = 2000;
 int _cl_error_on_timeout = 0;
 int _cl_no_icount = 0;
 int _cl_flush_buffers = 0;
+double _cl_baud_tolerance = 1.0;	/* % allowable baud rate error */
 
 // Module variables
 unsigned char _write_count_value = 0;
@@ -84,15 +86,18 @@ unsigned char _read_count_value = 0;
 int _fd = -1;
 unsigned char * _write_data;
 ssize_t _write_size;
-int _e_baud = 0;
 int _ss_baud_base = 0;
 int _ss_custom_divisor = 0;
 bool _is_standard_baud = 0;
+long long int _rep_baud = 0;	/* reported baudrate from termios */
+long long int _est_baud = 0;	/* estimated baudrate, used by exit_handler() */
 
 // keep our own counts for cases where the driver stats don't work
 long long int _write_count = 0;
 long long int _read_count = 0;
 long long int _error_count = 0;
+
+// calculated values
 
 volatile sig_atomic_t sigint_received = 0;
 void sigint_handler(int s)
@@ -124,7 +129,7 @@ static int disable_closing_wait()
 	int eta = 999999999;
 
 	// Don't bother trying if it won't take long to drain.
-	int baud = _e_baud?_e_baud:_cl_baud;
+	int baud = _est_baud?_est_baud:_cl_baud;
 	if (baud) {
 		eta = ( _write_count - _read_count) * bitsperframe() / baud;
 	}
@@ -145,7 +150,7 @@ static int disable_closing_wait()
 	ss.closing_wait = ASYNC_CLOSING_WAIT_NONE;
 	if (ioctl(_fd, TIOCSSERIAL, &ss) < 0) {
 		perror("TIOCSSERIAL ASYNC_CLOSING_WAIT_NONE");
-		fprintf(stderr, "Estimated time to drain: %d seconds", eta);
+		if (baud) fprintf(stderr, "Estimated time to drain: %d seconds", eta);
 		if (eta > oldcw/100) {
 			fprintf(stderr, " (closing_wait max is %ds)", oldcw/100);
 		}
@@ -365,6 +370,10 @@ static int get_baud(int baud)
 	case 4000000:
 		return B4000000;
 #endif
+#ifdef B6000000
+	case 6000000:
+		return B6000000;
+#endif
 	default:
 		return -1;
 	}
@@ -394,12 +403,12 @@ void set_modem_lines(int fd, int bits, int mask)
 
 static void display_help(void)
 {
-	printf("Usage: linux-serial-test [OPTION]\n"
+	printf("Usage: linux-serial-test <-p PORT> [OPTION]\n"
 			"\n"
 			"  -h, --help\n"
 			"  -b, --baud               Baud rate, 115200, etc (115200 is default)\n"
 			"  -p, --port               Port (/dev/ttyS0, etc) (must be specified)\n"
-			"  -d, --divisor            UART Baud rate divisor (can be used to set custom baud rates)\n"
+			"  -d, --divisor            UART Baud rate divisor (old way to set custom baud rates)\n"
 			"  -D, --rx_dump            Dump Rx data (ascii, raw)\n"
 			"  -T, --detailed_tx        Detailed Tx data\n"
 			"  -R, --detailed_rx        Detailed Rx data\n"
@@ -434,6 +443,7 @@ static void display_help(void)
 			"  -W, --tx-wait            Number of seconds to wait before to transmit (defaults to 0, meaning no wait)\n"
 			"  -Z, --error-on-timeout   Treat timeouts as errors\n"
 			"  -n, --no-icount          Do not request driver for counts of input serial line interrupts (TIOCGICOUNT)\n"
+			"  -L, --baud-tolerance     Percentage difference at which an error is signaled\n"
 			"  -f, --flush-buffers      Flush RX and TX buffers before starting\n"
 			"\n"
 		);
@@ -443,7 +453,7 @@ static void process_options(int argc, char * argv[])
 {
 	for (;;) {
 		int option_index = 0;
-		static const char *short_options = "hb:p:d:D:TRsSy:z:cBertq:Qml:a:w:o:i:P:kKAI:O:W:Znf";
+		static const char *short_options = "hb:p:d:D:TRsSy:z:cBertq:Qml:a:w:o:i:P:kKAI:L:O:W:Znf";
 		static const struct option long_options[] = {
 			{"help", no_argument, 0, 0},
 			{"baud", required_argument, 0, 'b'},
@@ -478,7 +488,8 @@ static void process_options(int argc, char * argv[])
 			{"tx-timeout", required_argument, 0, 'O'},
 			{"error-on-timeout", no_argument, 0, 'Z'},
 			{"no-icount", no_argument, 0, 'n'},
-			{"flush-buffers", no_argument, 0, 'f'},
+			{"baud-tolerance", required_argument, 0, 'L'},
+ 			{"flush-buffers", no_argument, 0, 'f'},
 			{0,0,0,0},
 		};
 
@@ -496,7 +507,19 @@ static void process_options(int argc, char * argv[])
 			exit(0);
 			break;
 		case 'b':
-			_cl_baud = atoi(optarg);
+			double f = atof(optarg);
+			if (f > _speed_t_max || f < 0) {
+				fprintf(stderr, "ERROR: Invalid baud rate %'.0f ", f);
+				fprintf(stderr, "(termios2 max is %'llu)\n", (long long unsigned int) _speed_t_max);
+				exit(-EINVAL);
+			}
+			/* The ftdi_sio kernel 6.12 module crashes for baudrates between 2147483648 and 4294967296.
+			   Remove this once drivers have been updated to handle the full range of speed_t. */
+			if ((int32_t)f < 0) {
+				fprintf(stderr, "WARNING: baud rate of %'.0f exceeds signed int32 which\n"
+					        "         may cause certain kernel modules to crash!\n", f);
+			}
+			_cl_baud = (int)atof(optarg); 	/* Allow "3E6" instead of 3000000 */
 			break;
 		case 'p':
 			_cl_port = strdup(optarg);
@@ -613,6 +636,9 @@ static void process_options(int argc, char * argv[])
 		case 'n':
 			_cl_no_icount = 1;
 			break;
+		case 'L':
+			_cl_baud_tolerance = atof(optarg);
+			break;
 		case 'f':
 			_cl_flush_buffers = 1;
 			break;
@@ -621,6 +647,7 @@ static void process_options(int argc, char * argv[])
 }
 
 static void print_requested_baudrate() {
+	if (_cl_baud == 0) return;
 	printf("REQUESTED BAUDRATE: ");
 	printf(_is_standard_baud?"B":" ");
 	printf("%'12d", _cl_baud);
@@ -633,26 +660,40 @@ static void print_requested_baudrate() {
 	}
 }	
 
-double _errpercent = 0;
-static void print_estimated_baudrate(double duration) {
+static void print_reported_baudrate() {
+	if (_rep_baud == 0) return;
+	printf(" REPORTED BAUDRATE: ");
+	printf("%'13lld", _rep_baud); 
+	printf("\n");
+}	
+
+static double estimate_baudrate(double duration) {
 	int rx = _read_count;
 	int bits = bitsperframe();
-	double estimated = rx * bits / duration;
-        _errpercent =  ( 100.0*(_cl_baud - estimated) / _cl_baud );
-	if (_errpercent<0) _errpercent=-_errpercent;
-	printf("ESTIMATED BAUDRATE: %'16.2f", rx * bits / duration);
-	if ( _errpercent >= 1.0 )
-		printf("\t!+/- %.2f%% !", _errpercent);
+	if (!duration) return 0;
+	return rx * bits / duration;
+}	
+
+static double calculate_baud_error(double estimated) {
+	/* Percent variance of estimated baud from requested */
+	if (estimated == 0) return 0;
+	if (!_cl_baud) return 0;
+	if (_cl_no_rx) return 0;
+        double e = 100.0*(_cl_baud - estimated) / _cl_baud;
+	if (e<0) e=-e;
+	return e;
+}
+
+static void print_estimated_baudrate(double estimated, double baud_error, double duration) {
+	int rx = _read_count;
+	int bits = bitsperframe();
+	printf("ESTIMATED BAUDRATE: %'16.2f", estimated);
+	if ( (baud_error >= _cl_baud_tolerance) && (_cl_baud > 0) )
+		printf("\t!+/- %.2f%% !", baud_error);
 	printf("\n");
 	printf("\t(%d frames, %d bits each, received in %.2f seconds)\n",
 	       rx, bits, duration);
-}	
-
-static double estimated_baudrate(double duration) {
-	int rx = _read_count;
-	int bits = bitsperframe();
-	return rx * bits / duration;
-}	
+}
 
 static void dump_serial_port_stats(void)
 {
@@ -684,43 +725,42 @@ static void process_read_data(void)
 {
 	const int RBSIZE = 1024;
 	unsigned char rb[RBSIZE];
-	int actual_read_count = 0;
-	while (actual_read_count < RBSIZE) {
-		int c = read(_fd, &rb, (RBSIZE-actual_read_count));
-		if (c > 0) {
-			if (_cl_rx_dump) {
-				if (_cl_rx_dump_ascii)
-					dump_data_ascii(rb, c);
-				else
-					dump_data(rb, c);
-			}
-
-			// verify read count is incrementing
-			int i;
-			for (i = 0; i < c; i++) {
-				if (rb[i] != _read_count_value) {
-					if (_cl_dump_err) {
-						printf("Error, count: %lld, expected %02x, got %02x c %x\n",
-							_read_count + i, _read_count_value, rb[i], c);
-					}
-					_error_count++;
-					if (_cl_stop_on_error) {
-						dump_serial_port_stats();
-						exit(-EIO);
-					}
-					_read_count_value = rb[i];
-				}
-				_read_count_value = next_count_value(_read_count_value);
-			}
-			_read_count += c;
-			actual_read_count += c;
-		} else {
-			break; // Do not continue! We already loop on reading.
+	int c = read(_fd, &rb, RBSIZE);
+	if (c > 0) {
+		if (_cl_rx_dump) {
+			if (_cl_rx_dump_ascii)
+				dump_data_ascii(rb, c);
+			else
+				dump_data(rb, c);
 		}
+
+		// verify read count is incrementing
+		int i;
+		for (i = 0; i < c; i++) {
+			if (rb[i] != _read_count_value) {
+				if (_cl_dump_err) {
+					printf("Error, count: %lld, expected %02x, got %02x c %x\n",
+					       _read_count + i, _read_count_value, rb[i], c);
+				}
+				_error_count++;
+				if (_cl_stop_on_error) {
+					dump_serial_port_stats();
+					exit(-EIO);
+				}
+				_read_count_value = rb[i];
+			}
+			_read_count_value = next_count_value(_read_count_value);
+		}
+		_read_count += c;
 	}
+	if ( (c == -1) && (errno != EAGAIN) ) {
+		perror("read failed");
+	}
+	
 	if (_cl_rx_detailed) {
-		printf("Read %d bytes %s\n", actual_read_count,
-		       (actual_read_count < RBSIZE)?"":"(buffer limit)");
+		printf("Read +%d bytes, %lld bytes total", c, _read_count);
+		if (c >= RBSIZE) printf(" (buffer limit of %d)", RBSIZE);
+		printf("\n");
 	}
 }
 
@@ -761,6 +801,12 @@ static void process_write_data(void)
 
 		count += c;
 
+		if (_cl_tx_detailed) {
+			printf("Wrote +%'6zd bytes, %lld bytes total", c, _write_count + count);
+			if (c >= _write_size) printf(" (limited by buffer size)");
+			printf("\n");
+		}
+
 		if (c < actual_write_size) {
 			_write_count_value = _write_data[c];
 			repeat = 0;
@@ -770,7 +816,7 @@ static void process_write_data(void)
 	_write_count += count;
 
 	if (_cl_tx_detailed)
-		printf("wrote %zd bytes\n", count);
+		printf("      =%'6zd bytes written before blocking\n", count);
 }
 
 
@@ -894,15 +940,18 @@ static int diff_s(const struct timespec *t1, const struct timespec *t2)
 	return t1->tv_sec - t2->tv_sec;
 }
 
+static const int _max_error_rv = 125;
 static int compute_error_count(void)
 {
-	long long int result;
+	long long int result = _error_count;
+#ifdef UNBUFFEREDWRITE
 	if (_cl_no_rx == 1 || _cl_no_tx == 1)
 		result = _error_count;
 	else
 		result = llabs(_write_count - _read_count) + _error_count;
+#endif
 
-	return (result > 125) ? 125 : (int)result;
+	return (result > _max_error_rv) ? _max_error_rv : (int)result;
 }
 
 int main(int argc, char * argv[])
@@ -938,7 +987,7 @@ int main(int argc, char * argv[])
 	} else if (baud <= 0) {
 		/* _cl_baud was specified and is not one of the predefined baudrates. */
 		setup_serial_port(B0);
-		if (set_custom_baud(_fd, _cl_baud)) {
+		if (bother_set_baud(_fd, _cl_baud)) {
 			printf("NOTE: termios2 failed to set non-standard baudrate, approximating using divisor\n");
 			set_baud_divisor(_cl_baud, _cl_divisor);
 			baud = B38400;
@@ -955,6 +1004,12 @@ int main(int argc, char * argv[])
 		clear_custom_speed_flag();
 	}
 
+	_rep_baud = bother_get_baud(_fd);
+	if ( _cl_baud > 0 && _rep_baud > 0 && _rep_baud != _cl_baud ) {
+		fprintf(stderr, "ERROR: tried to set baudrate to %d but driver reported %lld\n", _cl_baud, _rep_baud);
+		exit(-EBADRQC);
+	}
+
 	set_modem_lines(_fd, _cl_loopback ? TIOCM_LOOP : 0, TIOCM_LOOP);
 
 	if (_cl_single_byte >= 0) {
@@ -968,7 +1023,7 @@ int main(int argc, char * argv[])
 		}
 		written = write(_fd, &data, bytes);
 		if (written < 0) {
-			int ret = errno;
+			int ret = -errno;
 			perror("write()");
 			exit(ret);
 		} else if (written != bytes) {
@@ -1012,7 +1067,7 @@ int main(int argc, char * argv[])
 		tcflush(_fd, TCIOFLUSH);
 	}
 
-	struct timespec start_time, last_stat, last_timeout, last_read, last_write;
+	struct timespec start_time, last_stat, last_timeout, first_read={0}, last_read, last_write;
 
 	clock_gettime(CLOCK_MONOTONIC, &start_time);
 	last_stat = start_time;
@@ -1023,7 +1078,8 @@ int main(int argc, char * argv[])
 	if (_cl_tx_wait)
 		serial_poll.events &= ~POLLOUT;
 
-	while (!(_cl_no_rx && _cl_no_tx) && !sigint_received ) {
+	int no_rx = _cl_no_rx, no_tx = _cl_no_tx;
+	while (!(no_rx && no_tx) && !sigint_received ) {
 		struct timespec current;
 		int retval = poll(&serial_poll, 1, 1000);
 
@@ -1032,12 +1088,12 @@ int main(int argc, char * argv[])
 		if (_cl_tx_wait) {
 			if (diff_s(&current, &start_time) >= _cl_tx_wait) {
 				_cl_tx_wait = 0;
-				_cl_no_tx = 0;
+				no_tx = 0;
 				serial_poll.events |= POLLOUT;
 				printf("Start transmitting.\n");
 			} else {
-				if (!_cl_no_tx) {
-					_cl_no_tx = 1;
+				if (!no_tx) {
+					no_tx = 1;
 					serial_poll.events &= ~POLLOUT;
 				}
 			}
@@ -1047,17 +1103,14 @@ int main(int argc, char * argv[])
 			perror("poll()");
 		} else if (retval) {
 			if (serial_poll.revents & POLLIN) {
-				if (_cl_rx_delay) {
-					// only read if it has been rx-delay ms
-					// since the last read
-					if (diff_ms(&current, &last_read) > _cl_rx_delay) {
-						process_read_data();
-						last_read = current;
-					}
-				} else {
+				// _cl_rx_delay forces a wait between reads
+				if ( !_cl_rx_delay || diff_ms(&current, &last_read) > _cl_rx_delay) {
 					process_read_data();
 					last_read = current;
+					if (first_read.tv_sec == 0)
+						first_read = last_read;
 				}
+				
 			}
 
 			if (serial_poll.revents & POLLOUT) {
@@ -1080,13 +1133,13 @@ int main(int argc, char * argv[])
 			int rx_timeout, tx_timeout;
 
 			// Has it been over two seconds since we transmitted or received data?
-			rx_timeout = (!_cl_no_rx && diff_ms(&current, &last_read) > _cl_rx_timeout_ms);
-			tx_timeout = (!_cl_no_tx && diff_ms(&current, &last_write) > _cl_tx_timeout_ms);
+			rx_timeout = (!no_rx && diff_ms(&current, &last_read) > _cl_rx_timeout_ms);
+			tx_timeout = (!no_tx && diff_ms(&current, &last_write) > _cl_tx_timeout_ms);
 			// Special case - we don't want to warn about receive
 			// timeouts at the end of a loopback test (where we are
 			// no longer transmitting and the receive count equals
 			// the transmit count).
-			if (_cl_no_tx && _write_count != 0 && _write_count == _read_count) {
+			if (no_tx && _write_count != 0 && _write_count == _read_count) {
 				rx_timeout = 0;
 			}
 
@@ -1127,7 +1180,7 @@ int main(int argc, char * argv[])
 			if (current.tv_sec - start_time.tv_sec >= wait_time &&
 				current.tv_sec - start_time.tv_sec - wait_time >= _cl_tx_time ) {
 				_cl_tx_time = 0;
-				_cl_no_tx = 1;
+				no_tx = 1;
 				serial_poll.events &= ~POLLOUT;
 				printf("Stopped transmitting.\n");
 			}
@@ -1136,7 +1189,7 @@ int main(int argc, char * argv[])
 		if (_cl_rx_time) {
 			if (current.tv_sec - start_time.tv_sec >= _cl_rx_time) {
 				_cl_rx_time = 0;
-				_cl_no_rx = 1;
+				no_rx = 1;
 				serial_poll.events &= ~POLLIN;
 				printf("Stopped receiving.\n");
 			}
@@ -1146,10 +1199,39 @@ int main(int argc, char * argv[])
 	printf("Terminating ...\n");
 	tcflush(_fd, TCIOFLUSH);
 	dump_serial_port_stats();
-	print_requested_baudrate();
-	print_estimated_baudrate(diff_ms(&last_read, &start_time)/1000.0);
-	_e_baud = estimated_baudrate(diff_ms(&last_read, &start_time)/1000.0);
 	set_modem_lines(_fd, 0, TIOCM_LOOP); //seems not to be relevant for RTS reset
 
-	return compute_error_count() || (_errpercent>1.0);
+	print_requested_baudrate();
+	print_reported_baudrate();
+
+	/* estimate rx baudrate and % difference from requested */
+	double duration = diff_ms(&last_read, &first_read)/1000.0;
+	_est_baud = estimate_baudrate(duration);
+	double baud_error = calculate_baud_error(_est_baud);
+	print_estimated_baudrate(_est_baud, baud_error, duration);
+
+	int rv = 0; 
+	if ( (_read_count == 0) && (_write_count > 0) && !_cl_no_rx ) {
+		fprintf(stderr, "ERROR: No data received. Maybe loopback is not plugged in?\n");
+		rv = -ENOLINK;
+	}
+
+	if ( (_read_count == 0) && _cl_write_after_read ) {
+		fprintf(stderr, "ERROR: No data received. Check multi-serial loopback.\n");
+		rv = -ENOLINK;
+	}
+
+	if ( rv == 0 ) {
+		/* Return an integer from 1 to 125 if there were rx errors */
+		rv = compute_error_count();
+	}
+	
+	if ( rv == 0 ) {
+		/* Check for baudrate out of tolerance */
+		if (baud_error  > _cl_baud_tolerance) {
+			rv = _max_error_rv + 1; 
+		}
+	}
+
+	return rv;
 }
