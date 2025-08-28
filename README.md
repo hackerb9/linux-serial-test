@@ -26,7 +26,7 @@ changes by hackerb9 which may or may not be improvements.
 1. Allow non-standard baudrates to be specified directly instead of
    requiring a clock divisor. E.g., `-b 512000`.
 1. Allow baudrates to be specified in "exponential notation" (see
-   strtod(3)). For example, `-b 3E6` would be equivalent to `-b 3000000`.
+   strtod(3)). For example, `-b 3e6` would be equivalent to `-b 3000000`.
 1. The results of the test are printed clearly when the program exits.
 
 # Compiling
@@ -82,7 +82,7 @@ Usage: linux-serial-test [OPTION]
   -W, --tx-wait            Number of seconds to wait before to transmit (defaults to 0, meaning no wait)
   -Z, --error-on-timeout   Treat timeouts as errors
   -n, --no-icount          Do not request driver for counts of input serial line interrupts (TIOCGICOUNT)
-  -f, --flush-buffers      Flush RX and TX buffers before starting
+  -f, --flush-buffers      Flush RX and TX buffers before st, arting
 ```
 
 
@@ -92,10 +92,10 @@ Usage: linux-serial-test [OPTION]
 
     linux-serial-test -s -e -p /dev/ttyUSB0 -b 3000000
 
-This will send full bandwidth data with a counting pattern on the TX signal.
-On any data received on RX, the program will look for a counting pattern and
-report any missing data in the pattern. This test can be done using a loopback
-cable. Hit ^C when done.
+This will send full bandwidth data with a counting pattern on the TX
+signal. On any data received on RX, the program will look for the
+counting pattern and report any missing data. This test should be done
+using a loopback cable. Hit ^C when done.
 
 ## Test RTS/CTS flow control
 
@@ -120,9 +120,18 @@ and on the transmitter side:
 
     linux-serial-test -s -e -p /dev/ttyUSB0 -b 115200 -o 5 -i 7
 
-This transmits for five seconds and receives for seven seconds, after which it
-will exit. The exit code will be zero if the received pattern was correct, so this
-can be used as part of an automated test script.
+This transmits for five seconds and receives for seven seconds, after
+which it will exit. The exit code will be zero if the received pattern
+was correct, so this can be used as part of an automated test script.
+
+See the [testallspeeds.sh](testallspeeds.sh) for an example wrapper
+script which will try the standard baudrates for 2 seconds each and
+report a summary. (The user will be asked for which serial port to use
+if there is more than one available.)
+
+Note that the time the program takes to run can be significantly
+longer than the -i or -o limits. See the note below about Linux's
+closing_wait.
 
 ## Output a pattern where you can easily verify baud rate with scope:
 
@@ -132,3 +141,51 @@ This outputs 10 bits that are easy to measure, and then multiply by 10
 in your head to get baud rate.
 
 ![verify baud rate](README.md.d/measure-baud-rate-example.png)
+
+# Bugs, Gremlins, and other Mischiefmakers
+
+* The Linux kernel buffers serial transmissions and, at low baud
+  rates, can end up causing a process to wait up to 30 seconds after
+  the program has ended. Only by running this program as root can that
+  buffer be flushed instead of drained.
+
+* The `-r` and `-t` options are confusingly named as they mean
+  _inhibit_ receive and transmit, respectively.
+  
+  (There are a *lot* of flags. Perhaps a different command-line
+  interface is warranted.)
+  
+* The --write-follow option reverses the way the program works and may
+  not be necessary.
+  
+* The `-R` and `-T` options do not actually dump the data, which is a
+  bit confusing. They seem to merely increase verbosity.
+  
+* Flushing the Rx/Tx buffers at startup ought to be the default even
+  without --flush-buffers.
+  
+* Baudrate estimation has proven useful, but there is at least one
+  case in which the bits-per-second appears lower because the hardware
+  is silently adding a second stopbit.
+
+* There should be illustrations for the loopback and dual-serial ports
+  configurations.
+  
+* Dual-serial ports should be able to be handled by a single process
+  instead of two. 
+
+* This program has not been tested above 3 Mbaud.
+
+* RTS/CTS (hardware flow control) breaks down on some UARTs at
+  extremely high speeds. For example, FTDI's application note for the
+  FT232H says it can be set to 12 Mbaud, but then CTS/RTS may lose
+  data.
+
+* There is no test, yet, for software flow control (XON/XOFF). In
+  particular, better serial ports have "hardware supported XON/XOFF"
+  which will work even on UARTs with large FIFOs. It may even work at
+  12 Mbaud because it skips having to send the signal to the other
+  side to request transmission to cease.
+  
+* There should be options to print out just a single statistic for
+  better shell scriptability.
