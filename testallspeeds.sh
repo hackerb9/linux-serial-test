@@ -57,7 +57,8 @@ getport() {
 	if [[ ${#port[@]} -eq 1 ]]; then
 	    echo "Detected serial port at ${port[0]}"
 	elif [[ ${#port[@]} -eq 0 ]]; then
-	    echo "Error: No working serial ports found." >&2
+	    echo "ERROR: Could not access any serial ports." >&2
+	    checkttypermissions | sed 's/^/  /' >&2
 	    exit 1
 	else
 	    echo "${#port[@]} serial ports found. Please select one of ${port[@]}."
@@ -90,9 +91,11 @@ getport() {
 }
 
 availableports() {
+    cd /sys/class/tty || exit 1
     exec 5<&1 >/dev/tty
     echo "Possible serial devices: "
-    for p in $(setserial -g /dev/tty* 2>/dev/null | cut -f1 -d,); do
+    for p in $(stat -c %N * | grep -v virtual | cut -f2 -d"'"); do
+	p=/dev/$p
 	if [[ ! -r $p || ! -w $p ]]; then
 	    echo "	$p: ERROR: Permission denied"
 	    continue
@@ -104,7 +107,31 @@ availableports() {
 	echo "	$p: OK"
 	echo $p >&5
     done
+    cd -
 }    
+
+checkttypermissions() {
+    local t
+    local -a unreadable
+    local -A ungroup
+    for t in /dev/ttyS* /dev/ttyUSB* /dev/ttyACM*; do
+	if [[ -e $t && ! -r $t ]]; then
+	    unreadable+=($t)
+	    if [[ $(find $t -perm -g=rw) ]]; then
+		ungroup[$(stat -c %G $t)]=1
+	    fi
+	fi
+    done
+    if [[ $unreadable ]]; then
+	echo "Permission denied:"
+	ls -l "${unreadable[@]}"
+	if [[ ${#ungroup[@]} -gt 0 ]]; then
+	    echo "Consider:" 
+	    echo "  sudo adduser $USER ${!ungroup[@]}"
+	    echo "  newgrp ${!ungroup[@]}"
+	fi
+    fi
+}
 
 init() {
     declare -ag strerr
